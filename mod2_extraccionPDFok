@@ -1,0 +1,234 @@
+import os
+import sys
+import re
+import pandas as pd
+import pdfplumber
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+if sys.platform == "win32":
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+ruta_carpeta = os.path.join(BASE, "uploads_temp")
+NOMBRE_EXCEL = "Extraccion_DEFFEB21.xlsx"
+
+NITS_IGNORAR = {
+    "899999061","900600008","899999282","282943","5111809000",
+    "2436150103","2436030100","2436050100","2436060100","2436080100",
+    "2436260100","2436250100","2436270100","2436901001","1906040200","2401020100"
+}
+
+RE_CONTRATO   = re.compile(r'CPS\s*(\d+[-/]\d+)', re.IGNORECASE)
+RE_NIT        = re.compile(r'(\d{7,12})')
+RE_RANGO      = re.compile(r'DEL\s+(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\s+AL\s+(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})', re.IGNORECASE)
+RE_PAGO_DE    = re.compile(r'PAGO\s+(?:N[°º.]?\s*)?(\d+)\s+DE\s+(\d+)', re.IGNORECASE)
+RE_MONTO      = re.compile(r'[\d.,]+')
+RE_RP_DOC     = re.compile(r'RP\s*Doc(?:umento)?\s*(?:Presupuestal)?\s*[:\s]+(\d{8,12})', re.IGNORECASE)
+RE_SALDO_CRP  = re.compile(r'[Ss]aldo\s*CRP\s*[:\s]+(\d[\d.,]*)', re.IGNORECASE)
+RE_BANCO      = re.compile(r'C[oó]d(?:igo)?\s*[Bb]co\.?\s*[:\s]+(\d{1,4})', re.IGNORECASE)
+RE_CUENTA     = re.compile(r'No\.?\s*[Cc]uenta\s*[:\s]+([\d\-]{6,20})', re.IGNORECASE)
+RE_TIPO_CTA   = re.compile(r'Tipo\s*[Cc]ta\.?\s*[:\s]*(\d{2})', re.IGNORECASE)
+
+RETEICA_MAP = {
+    "0,966": "0,966%", "0,766": "0,766%", "0,866": "0,866%",
+    "0,998": "0,998%", "1,014": "1,014%", "1,200": "1,200%",
+    "1,500": "1,500%", "0,500": "0,500%",
+}
+
+def limpiar_monto(texto):
+    if not texto: return 0
+    m = RE_MONTO.search(str(texto))
+    if not m: return 0
+    s = m.group().replace('.','').replace(',','.')
+    try: return float(s)
+    except: return 0
+
+def fmt_fecha(d, m, a):
+    return f"{d.zfill(2)}/{m.zfill(2)}/{'20'+a if len(a)==2 else a}"
+
+def extraer_valor_linea(texto, patron):
+    """Busca patron en texto y devuelve el primer numero que sigue."""
+    idx = texto.upper().find(patron.upper())
+    if idx < 0: return 0
+    rest = texto[idx+len(patron):]
+    nums = RE_MONTO.findall(rest[:40])
+    return limpiar_monto(nums[0]) if nums else 0
+
+def procesar_pdf(path):
+    nombre = os.path.basename(path)
+    datos = {
+        'Archivo': nombre, 'Contrato': "N/A", 'Contratista': "N/A",
+        'NIT_CC': "N/A", 'PERIODO': 0, 'DEL': "N/A", 'AL': "N/A",
+        'PAGO No.': 0, 'Valor Bruto': 0, 'BASE RETEICA': "N/A",
+        'Valor Reteica': "N/A", 'TOTAL DESCUENTOS': 0, 'Neto a Pagar': 0,
+        'RP Doc Presupuestal': "N/A", 'saldo CRP': 0,
+        'Codigo Bco': "N/A", 'No Cuenta': "N/A", 'Tipo Cta': "N/A"
+    }
+
+    try:
+        with pdfplumber.open(path) as pdf:
+            # Solo extraer texto (sin tablas = mucho más rápido)
+            paginas = pdf.pages[:3]
+            lineas = []
+            for p in paginas:
+                t = p.extract_text(layout=False)
+                if t:
+                    lineas.extend(t.splitlines())
+            texto = " ".join(lineas)
+            texto_nl = "\n".join(lineas)
+
+        # Contrato
+        m = RE_CONTRATO.search(texto)
+        if m: datos['Contrato'] = m.group(1)
+
+        # NIT/CC — buscar explicitamente en la linea que diga "NIT" o "C.C."
+        RE_NIT_LABEL = re.compile(
+            r'NIT\.?\s*[oO]?\s*C\.?\s*C\.?\s*[:\s]+([0-9]{1,3}(?:\.[0-9]{3})+|[0-9]{6,12})',
+            re.IGNORECASE
+        )
+        m_nit = RE_NIT_LABEL.search(texto_nl)
+        if m_nit:
+            datos['NIT_CC'] = m_nit.group(1).replace('.', '')
+        else:
+            # Fallback: primer numero 7-12 digitos que no sea NIT a ignorar
+            for n in RE_NIT.findall(texto):
+                if n not in NITS_IGNORAR and len(n) <= 12:
+                    datos['NIT_CC'] = n
+                    break
+
+        # Pago N de N — varios formatos posibles:
+        # "PAGO 10 DE 10", "PAGO No. 10 ... 10 DE 10", "10 DE 10"
+        m = RE_PAGO_DE.search(texto)
+        if m:
+            datos['PAGO No.'] = int(m.group(1))
+            datos['PERIODO']  = int(m.group(2))
+        else:
+            # Buscar en lineas: "PAGO No." seguido de numero en misma o siguiente linea
+            for i, linea in enumerate(lineas):
+                lu = linea.upper()
+                if 'PAGO' in lu and 'NO' in lu:
+                    # Buscar numero en esta linea
+                    nums = re.findall(r'(\d{1,2})', linea)
+                    # Buscar "X DE Y" en la misma linea o en las 2 siguientes
+                    bloque = ' '.join(lineas[i:i+3])
+                    m2 = re.search(r'(\d{1,2})\s+DE\s+(\d{1,2})', bloque, re.IGNORECASE)
+                    if m2:
+                        datos['PAGO No.'] = int(m2.group(1))
+                        datos['PERIODO']  = int(m2.group(2))
+                        break
+                    elif nums:
+                        datos['PAGO No.'] = int(nums[0])
+                        break
+
+        # Rango de fechas
+        m = RE_RANGO.search(texto)
+        if m:
+            datos['DEL'] = fmt_fecha(m.group(1), m.group(2), m.group(3))
+            datos['AL']  = fmt_fecha(m.group(4), m.group(5), m.group(6))
+
+        # Montos — buscar en cada línea
+        for linea in lineas:
+            lu = linea.upper()
+            if 'CONTRATISTA' in lu and datos['Contratista'] == "N/A":
+                partes = linea.split(':', 1)
+                if len(partes) > 1 and partes[1].strip():
+                    datos['Contratista'] = partes[1].strip()
+            if 'VALOR BRUTO' in lu and datos['Valor Bruto'] == 0:
+                datos['Valor Bruto'] = limpiar_monto(linea.split()[-1])
+            # Fila "Reteica": "Reteica 2-4-36-27 2436270100 $ 599.527 0,966% $ 5.791"
+            # BASE = monto con puntos de miles antes del %, Valor = porcentaje
+            if 'RETEICA' in lu and 'RETEFUENTE' not in lu:
+                p_match = re.search(r'(\d+[,.]\d+)\s*%', linea)
+                if p_match:
+                    if datos['Valor Reteica'] == "N/A":
+                        pct = p_match.group(1).replace('.', ',')
+                        datos['Valor Reteica'] = f"{pct}%"
+                    if datos['BASE RETEICA'] == "N/A":
+                        parte_antes = linea[:p_match.start()]
+                        # Buscar montos: 1.488.480 o 599.527 (puntos de miles)
+                        montos = re.findall(r'\d{1,3}(?:\.\d{3})+', parte_antes)
+                        if montos:
+                            val = montos[-1].replace('.', '')
+                            try:
+                                datos['BASE RETEICA'] = int(val)
+                            except:
+                                pass
+                        else:
+                            # Sin puntos de miles, buscar numero >= 4 digitos
+                            nums = re.findall(r'\d{4,}', parte_antes)
+                            nums = [n for n in nums if n not in NITS_IGNORAR and len(n) <= 8]
+                            if nums:
+                                try:
+                                    datos['BASE RETEICA'] = int(nums[-1])
+                                except:
+                                    pass
+            if 'TOTAL DESCUENTOS' in lu and datos['TOTAL DESCUENTOS'] == 0:
+                datos['TOTAL DESCUENTOS'] = limpiar_monto(linea.split()[-1])
+            if 'NETO A PAGAR' in lu and datos['Neto a Pagar'] == 0:
+                datos['Neto a Pagar'] = limpiar_monto(linea.split()[-1])
+            if 'RP DOC' in lu and datos['RP Doc Presupuestal'] == "N/A":
+                nums = RE_NIT.findall(linea)
+                for n in nums:
+                    if n not in NITS_IGNORAR and len(n) >= 9:
+                        datos['RP Doc Presupuestal'] = n
+                        break
+            if 'SALDO CRP' in lu and datos['saldo CRP'] == 0:
+                datos['saldo CRP'] = limpiar_monto(linea.split()[-1])
+            if 'COD' in lu and 'BCO' in lu and datos['Codigo Bco'] == "N/A":
+                datos['Codigo Bco'] = linea.split()[-1]
+            if 'NO CUENTA' in lu or ('NO.' in lu and 'CUENTA' in lu):
+                if datos['No Cuenta'] == "N/A":
+                    datos['No Cuenta'] = linea.split()[-1]
+            if 'TIPO CTA' in lu and datos['Tipo Cta'] == "N/A":
+                datos['Tipo Cta'] = linea.split()[-1]
+
+        # Fallback regex para RP Doc si no se encontró por línea
+        if datos['RP Doc Presupuestal'] == "N/A":
+            m = RE_RP_DOC.search(texto_nl)
+            if m: datos['RP Doc Presupuestal'] = m.group(1)
+
+    except Exception as e:
+        print(f"  ERROR {nombre}: {e}")
+
+    return datos
+
+def ejecutar():
+    archivos = sorted([f for f in os.listdir(ruta_carpeta) if f.lower().endswith(".pdf")])
+    total = len(archivos)
+    print(f"Procesando {total} archivos PDF en paralelo...\n")
+
+    resultados = [None] * total
+    rutas = [os.path.join(ruta_carpeta, f) for f in archivos]
+
+    # Paralelo: usar hasta 6 hilos (I/O bound)
+    MAX_WORKERS = min(6, total) if total > 0 else 1
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futuros = {executor.submit(procesar_pdf, r): i for i, r in enumerate(rutas)}
+        completados = 0
+        for fut in as_completed(futuros):
+            i = futuros[fut]
+            res = fut.result()
+            resultados[i] = res
+            completados += 1
+            print(f"  [{completados:03d}/{total}] {res['Archivo'][:45]:45s} | NIT: {res['NIT_CC']:12s} | Pago: {res['PAGO No.']}")
+
+    resultados = [r for r in resultados if r is not None]
+
+    if resultados:
+        columnas = [
+            'Archivo','Contrato','Contratista','NIT_CC','PERIODO',
+            'DEL','AL','PAGO No.','Valor Bruto','BASE RETEICA',
+            'Valor Reteica','TOTAL DESCUENTOS','Neto a Pagar',
+            'RP Doc Presupuestal','saldo CRP','Codigo Bco','No Cuenta','Tipo Cta'
+        ]
+        df = pd.DataFrame(resultados)[columnas]
+        ruta_final = os.path.join(ruta_carpeta, NOMBRE_EXCEL)
+        df.to_excel(ruta_final, index=False)
+        print(f"\nLISTO: {ruta_final}")
+        print(f"__EXCEL__:{NOMBRE_EXCEL}")
+    else:
+        print("No se encontraron PDFs para procesar.")
+
+if __name__ == "__main__":
+    ejecutar()
